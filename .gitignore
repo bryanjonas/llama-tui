@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+
+# llama.cpp binaries / archives
+llama-b*/
+*.tar.gz
+*.zip
+
+# Runtime data (user-specific, never commit)
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
