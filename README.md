@@ -51,7 +51,7 @@ The main screen shows one panel per GPU side by side:
 │ ● RUNNING (1234) │  │ ○ STOPPED        │  │ ● RUNNING (5678) │
 │ mistral-7b.gguf  │  │ —                │  │ llama-3.gguf     │
 │                  │  │                  │  │                  │
-│ [■ Stop        ] │  │ [▶ Start       ] │  │ [■ Stop        ] │
+│ [■ Stop        ] │  │ [▶ Start      ] │  │ [■ Stop        ] │
 │ [⊞ Change Model] │  │ [⊞ Change Model] │  │ [⊞ Change Model] │
 │ [⚙ Flags       ] │  │ [⚙ Flags       ] │  │ [⚙ Flags       ] │
 │ [≡ View Logs   ] │  │ [≡ View Logs   ] │  │ [≡ View Logs   ] │
