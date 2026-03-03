@@ -376,7 +376,7 @@ class LogScreen(Screen):
             f" GPU {gpu} — {name}  |  Port {port}  |  Live Log ",
             id="log-banner",
         )
-        yield RichLog(id="log-out", highlight=True, markup=True, wrap=True)
+        yield RichLog(id="log-out", highlight=True, markup=False, wrap=True)
         yield Footer()
 
     def on_mount(self) -> None:

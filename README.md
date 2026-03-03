@@ -19,7 +19,7 @@ Quitting the TUI leaves every server running. The servers are not children of th
 ## Installation
 
 ```bash
-git clone <repo>
+git clone https://github.com/bryanjonas/llama-tui
 cd llama-tui
 ./run.sh          # creates .venv, installs deps, launches the app
 ```
