@@ -5,7 +5,7 @@ __pycache__/
 .venv/
 
 # llama.cpp binaries / archives
-llama-b*/
+llama-*/
 *.tar.gz
 *.zip
 

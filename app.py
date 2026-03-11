@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shlex
 import subprocess
 import sys
 from datetime import datetime
@@ -49,6 +50,7 @@ DOWNLOADS_DIR  = CONFIG_DIR / "downloads"
 DEFAULT_MODELS = Path.home() / "models"
 HF_TOKEN_FILE  = Path.home() / ".cache" / "huggingface" / "token"
 SCRIPT_DIR     = Path(__file__).parent
+DEFAULT_LLAMA_SERVER = str((SCRIPT_DIR / "llama-cuda" / "llama-server").resolve())
 
 NUM_GPUS  = 3
 BASE_PORT = 8080
@@ -67,11 +69,12 @@ DEFAULT_FLAGS: dict = {
     "parallel":   1,      # --parallel
     "mlock":      False,  # --mlock
     "no_mmap":    False,  # --no-mmap
+    "cuda_visible_devices": "",  # env: CUDA_VISIBLE_DEVICES (blank -> default GPU index)
     "extra_args": "",     # free-form passthrough
 }
 
 DEFAULT_CONFIG: dict = {
-    "llama_server_path": "llama-server",
+    "llama_server_path": DEFAULT_LLAMA_SERVER,
     "models_dir": str(DEFAULT_MODELS),
     "base_port": BASE_PORT,
     "services": [
@@ -79,7 +82,7 @@ DEFAULT_CONFIG: dict = {
             "gpu": i,
             "port": BASE_PORT + i,
             "model": None,
-            "flags": dict(DEFAULT_FLAGS),
+            "flags": {**DEFAULT_FLAGS, "cuda_visible_devices": str(i)},
         }
         for i in range(NUM_GPUS)
     ],
@@ -96,25 +99,33 @@ def load_config() -> dict:
             # Fill in any missing keys from defaults
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
+            # Migrate legacy/default server paths to local llama-cuda binary.
+            configured = str(cfg.get("llama_server_path", "")).strip()
+            if configured in {"", "llama-server"} or "llama-b8184/llama-server" in configured:
+                cfg["llama_server_path"] = DEFAULT_LLAMA_SERVER
             # Ensure all 3 service entries exist
             existing = {s["gpu"] for s in cfg.get("services", [])}
             for i in range(NUM_GPUS):
                 if i not in existing:
                     cfg["services"].append(
                         {"gpu": i, "port": BASE_PORT + i, "model": None,
-                         "flags": dict(DEFAULT_FLAGS)}
+                         "flags": {**DEFAULT_FLAGS, "cuda_visible_devices": str(i)}}
                     )
             # Migrate old extra_args string → structured flags dict
             for svc in cfg["services"]:
+                svc_gpu = int(svc.get("gpu", 0))
                 if "flags" not in svc:
                     old = svc.pop("extra_args", "")
-                    svc["flags"] = dict(DEFAULT_FLAGS)
+                    svc["flags"] = {**DEFAULT_FLAGS, "cuda_visible_devices": str(svc_gpu)}
                     if old:
                         svc["flags"]["extra_args"] = old
                 else:
                     # Ensure all flag keys exist
                     for k, v in DEFAULT_FLAGS.items():
-                        svc["flags"].setdefault(k, v)
+                        if k == "cuda_visible_devices":
+                            svc["flags"].setdefault(k, str(svc_gpu))
+                        else:
+                            svc["flags"].setdefault(k, v)
             cfg["services"].sort(key=lambda s: s["gpu"])
             return cfg
         except Exception:
@@ -136,13 +147,14 @@ def hf_token() -> str:
     return os.environ.get("HF_TOKEN", "")
 
 
-def scan_existing_llama_servers() -> dict[int, tuple[int, Optional[str]]]:
+def scan_existing_llama_servers() -> dict[int, tuple[int, Optional[str], Optional[str]]]:
     """Scan /proc for running llama-server processes.
 
-    Returns {port: (pid, model_path_or_None)} for each found instance.
+    Returns {port: (pid, model_path_or_None, cuda_visible_devices_or_None)}
+    for each found instance.
     """
     import signal as _signal
-    results: dict[int, tuple[int, Optional[str]]] = {}
+    results: dict[int, tuple[int, Optional[str], Optional[str]]] = {}
     proc_dir = Path("/proc")
     for pid_dir in proc_dir.iterdir():
         if not pid_dir.name.isdigit():
@@ -154,6 +166,7 @@ def scan_existing_llama_servers() -> dict[int, tuple[int, Optional[str]]]:
                 continue
             port:  Optional[int] = None
             model: Optional[str] = None
+            cuda_visible_devices: Optional[str] = None
             for i, arg in enumerate(args):
                 if arg == "--port" and i + 1 < len(args):
                     try:
@@ -162,8 +175,17 @@ def scan_existing_llama_servers() -> dict[int, tuple[int, Optional[str]]]:
                         pass
                 elif arg == "--model" and i + 1 < len(args):
                     model = args[i + 1] or None
+            try:
+                raw_env = (pid_dir / "environ").read_bytes().decode(errors="replace")
+                for entry in raw_env.split("\x00"):
+                    if entry.startswith("CUDA_VISIBLE_DEVICES="):
+                        value = entry.split("=", 1)[1].strip()
+                        cuda_visible_devices = value or None
+                        break
+            except (PermissionError, FileNotFoundError, OSError):
+                pass
             if port is not None:
-                results[port] = (int(pid_dir.name), model)
+                results[port] = (int(pid_dir.name), model, cuda_visible_devices)
         except (PermissionError, FileNotFoundError, OSError):
             continue
     return results
@@ -207,7 +229,25 @@ class ServiceProcess:
             args.append("--no-mmap")
         extra = (f.get("extra_args") or "").strip()
         if extra:
-            args += extra.split()
+            # Keep TUI-managed flags authoritative; ignore duplicates in extra_args.
+            managed_with_value = {"-c", "--ctx-size", "-ngl", "--threads", "--parallel"}
+            managed_switches = {"--flash-attn", "--mlock", "--no-mmap"}
+            tokens = shlex.split(extra)
+            filtered: list[str] = []
+            i = 0
+            while i < len(tokens):
+                t = tokens[i]
+                if t in managed_with_value:
+                    i += 2
+                    continue
+                if t in managed_switches:
+                    i += 1
+                    if i < len(tokens) and not tokens[i].startswith("-"):
+                        i += 1
+                    continue
+                filtered.append(t)
+                i += 1
+            args += filtered
         return args
 
     def attach(self, pid: int, model: Optional[str] = None) -> None:
@@ -240,6 +280,10 @@ class ServiceProcess:
     def log_path(self) -> Path:
         return LOG_DIR / f"gpu-{self.gpu}.log"
 
+    def effective_cuda_visible_devices(self) -> str:
+        value = str(self.flags.get("cuda_visible_devices", "")).strip()
+        return value if value else str(self.gpu)
+
     async def start(self, server_bin: str, model: str) -> None:
         if self.is_running:
             await self.stop()
@@ -255,7 +299,7 @@ class ServiceProcess:
         ] + self._build_args()
 
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu)
+        env["CUDA_VISIBLE_DEVICES"] = self.effective_cuda_visible_devices()
 
         # Append to log file
         log_path = self.log_path
@@ -265,6 +309,7 @@ class ServiceProcess:
         self._log_fh.write(
             f"\n{sep}\n"
             f"[{datetime.now().isoformat()}] START  gpu={self.gpu}  port={self.port}\n"
+            f"ENV: CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}\n"
             f"CMD: {' '.join(cmd)}\n"
             f"{sep}\n"
         )
@@ -720,6 +765,13 @@ class ServiceFlagsScreen(ModalScreen):
             with Horizontal(classes="flags-row"):
                 yield Label("--no-mmap:", classes="flags-lbl")
                 yield Switch(value=bool(f.get("no_mmap", False)), id="f-nm")
+            with Horizontal(classes="flags-row"):
+                yield Label("CUDA_VISIBLE_DEVICES:", classes="flags-lbl")
+                yield Input(
+                    value=str(f.get("cuda_visible_devices", str(self.gpu))),
+                    id="f-cvd",
+                    classes="flags-val",
+                )
             yield Label("Extra args (free-form):", id="f-extra-lbl")
             yield Input(value=f.get("extra_args", ""), id="f-extra")
             with Horizontal(id="flags-btns"):
@@ -746,6 +798,7 @@ class ServiceFlagsScreen(ModalScreen):
             "flash_attn": self.query_one("#f-fa", Switch).value,
             "mlock":      self.query_one("#f-ml", Switch).value,
             "no_mmap":    self.query_one("#f-nm", Switch).value,
+            "cuda_visible_devices": self.query_one("#f-cvd", Input).value.strip(),
             "extra_args": self.query_one("#f-extra", Input).value.strip(),
         }
         self.dismiss(result)
@@ -764,7 +817,7 @@ class SettingsScreen(Screen):
         yield Static(" Settings ", id="set-banner")
         with Vertical(id="set-body"):
             yield Label("llama-server binary path  (full path or name if in PATH):")
-            yield Input(value=cfg.get("llama_server_path", "llama-server"), id="s-bin")
+            yield Input(value=cfg.get("llama_server_path", DEFAULT_LLAMA_SERVER), id="s-bin")
             yield Label("Models directory:")
             yield Input(value=cfg.get("models_dir", str(DEFAULT_MODELS)), id="s-models")
             yield Label(
@@ -948,12 +1001,32 @@ class LlamaManager(App):
         found = scan_existing_llama_servers()
         for gpu, svc in self.services.items():
             if svc.port in found:
-                pid, model = found[svc.port]
+                pid, model, cuda_visible_devices = found[svc.port]
                 svc.attach(pid, model)   # model from cmdline takes priority
+                cuda = cuda_visible_devices if cuda_visible_devices else "<unset>"
                 self.notify(
-                    f"GPU {gpu}: attached to existing PID {pid}",
+                    f"GPU {gpu}: attached to existing PID {pid} (CUDA_VISIBLE_DEVICES={cuda})",
                     severity="information",
                 )
+                if cuda_visible_devices is None:
+                    self.notify(
+                        f"GPU {gpu}: PID {pid} has no CUDA_VISIBLE_DEVICES; it may span multiple GPUs.",
+                        severity="warning",
+                    )
+                elif "," in cuda_visible_devices:
+                    self.notify(
+                        f"GPU {gpu}: PID {pid} exposes multiple GPUs ({cuda_visible_devices}).",
+                        severity="warning",
+                    )
+                elif cuda_visible_devices != svc.effective_cuda_visible_devices():
+                    self.notify(
+                        (
+                            f"GPU {gpu}: PID {pid} is pinned to "
+                            f"CUDA_VISIBLE_DEVICES={cuda_visible_devices}, "
+                            f"expected {svc.effective_cuda_visible_devices()}."
+                        ),
+                        severity="warning",
+                    )
 
         for i in range(NUM_GPUS):
             self._refresh_panel(i)
@@ -1026,7 +1099,7 @@ class LlamaManager(App):
                 severity="warning",
             )
             return
-        server = self.config.get("llama_server_path", "llama-server")
+        server = self.config.get("llama_server_path", DEFAULT_LLAMA_SERVER)
         self.notify(f"GPU {gpu}: Starting on port {svc.port}…")
         try:
             await svc.start(server, svc.model)
@@ -1066,7 +1139,7 @@ class LlamaManager(App):
             await svc.stop()
             self._refresh_panel(gpu)
             await asyncio.sleep(0.5)
-            server = self.config.get("llama_server_path", "llama-server")
+            server = self.config.get("llama_server_path", DEFAULT_LLAMA_SERVER)
             try:
                 await svc.start(server, model)
                 self._refresh_panel(gpu)

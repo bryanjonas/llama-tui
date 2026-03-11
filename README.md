@@ -15,6 +15,7 @@ Quitting the TUI leaves every server running. The servers are not children of th
 - Python 3.9+
 - NVIDIA GPUs with CUDA (the app expects 3 GPUs by default; edit `NUM_GPUS` in `app.py` to change this)
 - A `llama-server` binary ([pre-built releases](https://github.com/ggml-org/llama.cpp/releases))
+  - This repo defaults to `./llama-cuda/llama-server`.
 
 ## Installation
 
@@ -36,7 +37,7 @@ python3 -m venv .venv
 
 ## First-time setup
 
-1. **Set the llama-server path** — press `s` to open Settings and enter the full path to your `llama-server` binary (or just `llama-server` if it is on your `PATH`).
+1. **Set the llama-server path** — press `s` to open Settings and enter the full path to your `llama-server` binary (default: `./llama-cuda/llama-server`, resolved to an absolute path).
 2. **Set the models directory** — also in Settings. Defaults to `~/models/`. Any `.gguf` files found recursively under this directory will appear in the model picker.
 3. **Select a model per GPU** — press `⊞ Change Model` on a panel to pick a `.gguf` file, then press `▶ Start` to launch the server.
 
@@ -58,7 +59,7 @@ The main screen shows one panel per GPU side by side:
 └──────────────────┘  └──────────────────┘  └──────────────────┘
 ```
 
-Each server listens on `0.0.0.0` and runs with `CUDA_VISIBLE_DEVICES` set to its GPU index, so GPU 0 → port 8080, GPU 1 → port 8081, GPU 2 → port 8082.
+Each server listens on `0.0.0.0`. By default, each panel uses its own GPU index (`0`, `1`, `2`) for `CUDA_VISIBLE_DEVICES`, but you can override this per panel (including multi-GPU values like `0,2`) in `⚙ Flags`.
 
 ## Keybindings
 
@@ -83,6 +84,7 @@ Press `⚙ Flags` on any panel to open the flags editor for that GPU:
 | Flash Attention | `--flash-attn true` | off |
 | mlock | `--mlock` | off |
 | no-mmap | `--no-mmap` | off |
+| CUDA devices | env `CUDA_VISIBLE_DEVICES` | panel GPU index |
 | Extra args | passed through verbatim | — |
 
 Flags are saved to `~/.llama-tui/config.json` and applied the next time a server is started. Changing flags does not restart a running server automatically.
@@ -131,6 +133,7 @@ Press `c` inside the log viewer to clear the log file. Download progress logs ar
         "parallel": 1,
         "mlock": false,
         "no_mmap": false,
+        "cuda_visible_devices": "0",
         "extra_args": ""
       }
     }
